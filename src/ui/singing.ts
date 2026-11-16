@@ -380,7 +380,7 @@ export async function playTune(idOrTune: string | Tune, body: BodyMix, ready?: (
       if (prev) {
         const last = events[prev.idxs[prev.idxs.length - 1]];
         const gap = e.start - (last.start + last.beats);
-        if (gap > 0.3) {
+        if (gap > 0.02) {
           phrases.push({ notes: [{ midi: e.midi, beats: e.beats, syl: e.syl }], startBeat: e.start, idxs: [i] });
         } else {
           prev.notes.push({ midi: e.midi, beats: e.beats, syl: e.syl });
