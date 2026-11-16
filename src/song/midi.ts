@@ -179,6 +179,8 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
 
   const bpm = Math.max(30, Math.min(240, Math.round(60000000 / (usPerQuarter || 500000))));
   const phrases = [melody.map((n): [number, number] => [n.midi, Math.max(0.0625, n.dur / tpq)])];
+  // Absolute timing for each sounding note (beats from file tick 0), so rests/gaps are preserved.
+  const timeline = melody.map((n) => ({ start: n.tick / tpq, beats: Math.max(0.0625, n.dur / tpq), midi: n.midi }));
 
   const base = (fileName.replace(/\.[^.]+$/, "") || melodyTrack.name || tracks.find((tr) => tr.name)?.name || "Imported").trim() || "Imported";
   const id = `midi:${base}:${Date.now().toString(36)}`;
@@ -215,9 +217,14 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
     lyrics: lyricsText,
   };
 
-  // Attach precomputed 1:1 syllables for exact MIDI lyric alignment (used when present).
+  // Attach precomputed 1:1 syllables and exact timing for MIDI lyric alignment (used when present).
   if (lyricSyls && lyricsText && lyricSyls.length === melody.length) {
-    (tune as Tune & { midiSyllables?: Syllable[] }).midiSyllables = lyricSyls;
+    const t = tune as Tune & { midiSyllables?: Syllable[]; midiTimeline?: { start: number; beats: number; midi: number }[] };
+    t.midiSyllables = lyricSyls;
+    t.midiTimeline = timeline;
+  } else {
+    // Even without aligned lyrics, keep exact note timing/gaps for faithful playback.
+    (tune as Tune & { midiTimeline?: { start: number; beats: number; midi: number }[] }).midiTimeline = timeline;
   }
 
   return { name: base, tune };

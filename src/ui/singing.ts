@@ -352,25 +352,71 @@ export async function playTune(idOrTune: string | Tune, body: BodyMix, ready?: (
   const words = own.length ? own : lyricsToSyllables(la(tune));
   const shift = tune.octave[nearestBody(body)] * 12 + st.key;
   const midiSyls = (tune as Tune & { midiSyllables?: Syllable[] }).midiSyllables;
+  const midiTimeline = (tune as Tune & { midiTimeline?: { start: number; beats: number; midi: number }[] }).midiTimeline;
+  const bpm = tune.bpm * st.tempo;
+  const t0 = 0.35;
+  const beat = 60 / bpm;
+
+  // Imported MIDI with exact note timing and aligned syllables: preserve rests/gaps by planning
+  // contiguous phrases at their original beat positions (like `chimera render notes`).
+  if (midiSyls && midiTimeline && tune.lyrics !== undefined && st.lyrics === tune.lyrics && midiSyls.length === midiTimeline.length) {
+    const events = midiTimeline.map((e, i) => ({ ...e, midi: e.midi + shift, syl: midiSyls[i] }));
+    const phrases: { notes: { midi: number; beats: number; syl: Syllable }[]; startBeat: number; idxs: number[] }[] = [];
+    for (let i = 0; i < events.length; i++) {
+      const e = events[i];
+      const prev = phrases[phrases.length - 1];
+      if (prev) {
+        const last = events[prev.idxs[prev.idxs.length - 1]];
+        const gap = e.start - (last.start + last.beats);
+        if (gap > 0.3) {
+          phrases.push({ notes: [{ midi: e.midi, beats: e.beats, syl: e.syl }], startBeat: e.start, idxs: [i] });
+        } else {
+          prev.notes.push({ midi: e.midi, beats: e.beats, syl: e.syl });
+          prev.idxs.push(i);
+        }
+      } else {
+        phrases.push({ notes: [{ midi: e.midi, beats: e.beats, syl: e.syl }], startBeat: e.start, idxs: [i] });
+      }
+    }
+    const allGestures: Gesture[] = [];
+    const allSegments: { ipa: string; t0: number; t1: number; stress?: number; kind: string }[] = [];
+    let planEnd = 0;
+    const noteTimes: [number, number][] = new Array(events.length);
+    const allNotes: { midi: number; syl: Syllable }[] = new Array(events.length);
+    for (const ph of phrases) {
+      const plan = planSong(ph.notes, { body, bpm, t0: t0 + ph.startBeat * beat, vibrato: st.vibrato });
+      allGestures.push(...plan.gestures);
+      if (plan.segments) allSegments.push(...(plan.segments as any));
+      planEnd = Math.max(planEnd, plan.end);
+      ph.idxs.forEach((idx, j) => {
+        const a = t0 + events[idx].start * beat;
+        noteTimes[idx] = [a, a + events[idx].beats * beat];
+        allNotes[idx] = { midi: ph.notes[j].midi, syl: ph.notes[j].syl };
+      });
+    }
+    if (!events.length) return false;
+    hooks.onStart?.();
+    const planId = engine.schedule({ gestures: allGestures, segments: allSegments, end: planEnd });
+    const parent: number[] = events.map((_, i) => (events[i].syl.melisma && i > 0 ? 0 : i)); // placeholder, recompute
+    for (let i = 0; i < events.length; i++) parent[i] = events[i].syl.melisma && i > 0 ? parent[i - 1] : i;
+    const shown = parent.map((p) => written(events[p].syl));
+    const from = events.map((_, i) => i);
+    demoRun = { id: planId, times: noteTimes, midi: allNotes.map((n) => n.midi), text: allNotes.map((n) => n.syl.text), shown, parent, from, end: planEnd, offset: null, hooks };
+    useSing.setState({ syllables: midiSyls, cursor: Math.min(st.cursor, Math.max(0, midiSyls.length - 1)), playing: tune.id, at: -1 });
+    return true;
+  }
+
   // a song's own words, unedited: a syllable to each note as written (as `chimera render song`)
   const { notes, from } =
-    midiSyls && tune.lyrics !== undefined && st.lyrics === tune.lyrics && midiSyls.length === tune.phrases[0].length
-      ? {
-          notes: tune.phrases[0].map(([midi, beats], i) => ({ midi: midi + shift, beats, syl: midiSyls[i % midiSyls.length] })),
-          from: tune.phrases[0].map((_, i) => i % midiSyls.length),
-        }
-      : tune.lyrics !== undefined && st.lyrics === tune.lyrics && own.length
+    tune.lyrics !== undefined && st.lyrics === tune.lyrics && own.length
       ? {
           notes: tune.phrases[0].map(([midi, beats], i) => ({ midi: midi + shift, beats, syl: own[i % own.length] })),
           from: tune.phrases[0].map((_, i) => i % own.length),
         }
       : fitSong(tune, words, shift);
   if (!notes.length) return false;
-  const bpm = tune.bpm * st.tempo;
-  const t0 = 0.35;
   const plan = planSong(notes, { body, bpm, t0, vibrato: st.vibrato });
   hooks.onStart?.();
-  const beat = 60 / bpm;
   let t = t0;
   const times = notes.map((n): [number, number] => {
     const a = t;
