@@ -113,7 +113,10 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
         if (p + 1 > end) break;
         const note = buf[p++];
         const vel = buf[p++];
-        const idx = (b & 0x0f) * 128 + note;
+        const ch = b & 0x0f;
+        // skip percussion channel (MIDI ch 10 / index 9)
+        if (ch === 9) continue;
+        const idx = ch * 128 + note;
         const isOn = hi === 0x90 && vel > 0;
         if (isOn) {
           if (on[idx] >= 0 && tick > on[idx]) {
@@ -257,6 +260,7 @@ function pickMelodyTrack(tracks: TrackData[], lyrics: RawLyric[], tpq: number): 
 /** Reduce a note list to a single monophonic line (highest note where overlapping). */
 function toMonophonic(notes: RawNote[]): RawNote[] {
   if (!notes.length) return [];
+  // For notes starting at the same tick prefer highest pitch (and longest as tiebreaker).
   const sorted = [...notes].sort((a, b) => a.tick - b.tick || b.midi - a.midi || b.dur - a.dur);
   const out: RawNote[] = [];
   for (const n of sorted) {
@@ -267,28 +271,25 @@ function toMonophonic(notes: RawNote[]): RawNote[] {
     }
     const prevEnd = prev.tick + prev.dur;
     if (n.tick >= prevEnd - 1) {
-      // small gap/overlap at boundary: start next at/after previous end
-      if (n.tick < prevEnd) {
-        prev.dur = Math.max(1, n.tick - prev.tick);
-      }
+      // next note starts at/after previous ends (allow 1-tick boundary nudge)
+      if (n.tick < prevEnd) prev.dur = Math.max(1, n.tick - prev.tick);
       out.push({ ...n });
     } else {
-      // overlapping notes: keep the higher-pitched one
+      // overlapping: keep the higher-pitched note sounding at this time.
+      // Never defer a lower note to after the previous one - that invents melody notes.
       if (n.midi > prev.midi) {
+        // replace prev from n.tick onward with the higher note
         prev.dur = Math.max(1, n.tick - prev.tick);
-        if (prev.dur <= 1 && n.tick <= prev.tick) {
+        if (prev.dur <= 1) {
           out[out.length - 1] = { ...n };
         } else {
           out.push({ ...n });
         }
-      } else if (n.tick + n.dur > prevEnd) {
-        // lower note extends beyond: keep as continuation after prev ends
-        out.push({ midi: n.midi, tick: prevEnd, dur: n.tick + n.dur - prevEnd });
       }
+      // else: lower/equal note fully covered while prev sounds - discard
     }
   }
-  // remove zero/negative durations and sort
-  return out.filter((n) => n.dur > 0).sort((a, b) => a.tick - b.tick);
+  return out.filter((n) => n.dur > 0);
 }
 
 function decodeText(buf: Uint8Array, off: number, len: number): string {
