@@ -212,7 +212,7 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
     id,
     name: base,
     bpm,
-    octave: { male: -1, female: 0, child: 0 },
+    octave: { male: 0, female: 0, child: 0 },
     phrases,
     lyrics: lyricsText,
   };
