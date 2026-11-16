@@ -24,6 +24,14 @@ interface RawLyric {
   text: string;
 }
 
+interface TrackData {
+  name: string;
+  notes: RawNote[];
+  lyrics: RawLyric[];
+  /** tempo events (us per quarter) with their tick */
+  tempos: { tick: number; us: number }[];
+}
+
 function readStr(buf: Uint8Array, off: number, len: number): string {
   let s = "";
   for (let i = 0; i < len; i++) s += String.fromCharCode(buf[off + i]);
@@ -70,10 +78,7 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
   const tpq = division || 480; // ticks per quarter note
 
   let off = 8 + headerLen;
-  const notes: RawNote[] = [];
-  const lyrics: RawLyric[] = [];
-  let usPerQuarter = 500000; // 120 BPM
-  let trackName = "";
+  const tracks: TrackData[] = [];
 
   for (let t = 0; t < ntrks && off + 8 <= buf.length; t++) {
     if (readStr(buf, off, 4) !== "MTrk") break;
@@ -82,8 +87,9 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
     let p = off + 8;
     let tick = 0;
     let status = 0;
-    // sounding notes per channel*128 + note: start tick (stack for re-triggers)
-    const on: number[][] = Array.from({ length: 16 * 128 }, () => []);
+    const td: TrackData = { name: "", notes: [], lyrics: [], tempos: [] };
+    // active note start tick per channel*128 + note (-1 if off)
+    const on: Int32Array = new Int32Array(16 * 128).fill(-1);
     while (p < end) {
       const [delta, dv] = readVLQ(buf, p);
       p += dv;
@@ -91,11 +97,16 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
       if (p >= end) break;
       let b = buf[p];
       if (b < 0x80) {
-        // running status
+        // running status: b is the first data byte
         b = status;
       } else {
         p++;
         if (b < 0xf0) status = b;
+        else status = 0; // system common/real-time cancel running status
+      }
+      if (b === 0) {
+        // no valid running status; skip a byte to avoid stalling
+        continue;
       }
       const hi = b & 0xf0;
       if (hi === 0x90 || hi === 0x80) {
@@ -103,16 +114,23 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
         const note = buf[p++];
         const vel = buf[p++];
         const idx = (b & 0x0f) * 128 + note;
-        if (hi === 0x90 && vel > 0) {
-          on[idx].push(tick);
+        const isOn = hi === 0x90 && vel > 0;
+        if (isOn) {
+          if (on[idx] >= 0 && tick > on[idx]) {
+            // re-trigger: close previous note
+            td.notes.push({ midi: note, tick: on[idx], dur: tick - on[idx] });
+          }
+          on[idx] = tick;
         } else {
-          const start = on[idx].pop();
-          if (start !== undefined) notes.push({ midi: note, tick: start, dur: Math.max(1, tick - start) });
+          if (on[idx] >= 0) {
+            td.notes.push({ midi: note, tick: on[idx], dur: Math.max(1, tick - on[idx]) });
+            on[idx] = -1;
+          }
         }
       } else if (hi === 0xa0 || hi === 0xb0 || hi === 0xe0) {
-        p += 2;
+        p = Math.min(end, p + 2);
       } else if (hi === 0xc0 || hi === 0xd0) {
-        p += 1;
+        p = Math.min(end, p + 1);
       } else if (b === 0xff) {
         if (p >= end) break;
         const type = buf[p++];
@@ -121,52 +139,45 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
         const dataOff = p;
         p = Math.min(end, p + mlen);
         if (type === 0x51 && mlen === 3) {
-          usPerQuarter = (buf[dataOff] << 16) | (buf[dataOff + 1] << 8) | buf[dataOff + 2];
-        } else if (type === 0x03 && !trackName) {
-          trackName = decodeText(buf, dataOff, mlen).trim();
+          td.tempos.push({ tick, us: (buf[dataOff] << 16) | (buf[dataOff + 1] << 8) | buf[dataOff + 2] });
+        } else if (type === 0x03 && !td.name) {
+          td.name = decodeText(buf, dataOff, mlen).trim();
         } else if (type === 0x05 || type === 0x01) {
           const text = decodeText(buf, dataOff, mlen);
-          if (text.trim()) lyrics.push({ tick, text });
+          if (text.trim()) td.lyrics.push({ tick, text });
         }
       } else if (b === 0xf0 || b === 0xf7) {
         const [mlen, mv] = readVLQ(buf, p);
-        p += mv + mlen;
+        p = Math.min(end, p + mv + mlen);
       } else {
-        // unknown, try to continue
-        if (b >= 0x80) status = 0;
+        // unknown; running status already cleared for system messages above
       }
     }
     // close any hanging notes at track end
-    for (let i = 0; i < on.length; i++) for (const start of on[i]) if (tick > start) notes.push({ midi: i % 128, tick: start, dur: tick - start });
+    for (let i = 0; i < on.length; i++) if (on[i] >= 0 && tick > on[i]) td.notes.push({ midi: i % 128, tick: on[i], dur: tick - on[i] });
+    td.notes.sort((a, b) => a.tick - b.tick || a.midi - b.midi);
+    td.lyrics.sort((a, b) => a.tick - b.tick);
+    tracks.push(td);
     off = end;
   }
 
-  if (!notes.length) throw new Error("the MIDI file has no notes");
+  const allLyrics = tracks.flatMap((tr) => tr.lyrics).sort((a, b) => a.tick - b.tick);
+  const tempos = tracks.flatMap((tr) => tr.tempos).sort((a, b) => a.tick - b.tick);
+  const usPerQuarter = tempos.length ? tempos[0].us : 500000; // initial tempo for a single-BPM tune
 
-  // melody: if multiple notes overlap, keep the highest at each onset (a simple vocal line guess)
-  notes.sort((a, b) => a.tick - b.tick || b.midi - a.midi);
-  const melody: RawNote[] = [];
-  let lastEnd = -1;
-  for (const n of notes) {
-    if (n.tick >= lastEnd - 1) {
-      melody.push(n);
-      lastEnd = n.tick + n.dur;
-    } else if (melody.length && n.midi > melody[melody.length - 1].midi) {
-      // overlapping: prefer the higher note
-      const prev = melody[melody.length - 1];
-      prev.dur = Math.max(1, n.tick - prev.tick);
-      melody.push(n);
-      lastEnd = n.tick + n.dur;
-    }
-  }
+  const noteTracks = tracks.filter((tr) => tr.notes.length);
+  if (!noteTracks.length) throw new Error("the MIDI file has no notes");
+
+  const melodyTrack = pickMelodyTrack(noteTracks, allLyrics, tpq);
+  const melody = toMonophonic(melodyTrack.notes);
   if (!melody.length) throw new Error("the MIDI file has no melody notes");
 
-  lyrics.sort((a, b) => a.tick - b.tick);
+  const lyrics = allLyrics;
 
   const bpm = Math.max(30, Math.min(240, Math.round(60000000 / (usPerQuarter || 500000))));
-  const phrases = [melody.map((n): [number, number] => [n.midi, Math.max(0.125, n.dur / tpq)])];
+  const phrases = [melody.map((n): [number, number] => [n.midi, Math.max(0.0625, n.dur / tpq)])];
 
-  const base = (fileName.replace(/\.[^.]+$/, "") || trackName || "Imported").trim() || "Imported";
+  const base = (fileName.replace(/\.[^.]+$/, "") || melodyTrack.name || tracks.find((tr) => tr.name)?.name || "Imported").trim() || "Imported";
   const id = `midi:${base}:${Date.now().toString(36)}`;
 
   // Build lyrics aligned to notes. Prefer lyric events; fall back to "la" per note.
@@ -175,16 +186,16 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
   if (lyrics.length) {
     const built = buildLyrics(melody, lyrics);
     lyricsText = built.text;
-    // Parse the reconstructed text into syllables with phonemes via the engine's G2P.
-    lyricSyls = lyricsToSyllables(lyricsText);
-    // If syllable count doesn't match notes, keep text for display but don't claim a 1:1 lyric map
-    // (playback will fit words to the melody). This keeps singing working even with odd MIDI lyrics.
-    if (lyricSyls.length !== melody.length) {
+    try {
+      lyricSyls = lyricsToSyllables(lyricsText);
+    } catch {
+      lyricSyls = [];
+    }
+    if (!lyricSyls || lyricSyls.length !== melody.length) {
       // try per-token phonemes so each note still gets a syllable
       const tokens = built.tokens;
       if (tokens.length === melody.length) {
         lyricSyls = tokens.map((tok, i) => syllableFromToken(tok, i === melody.length - 1));
-        lyricsText = built.text;
       } else {
         lyricsText = undefined;
         lyricSyls = undefined;
@@ -207,6 +218,77 @@ export function parseMidi(buffer: ArrayBuffer, fileName = "Imported"): MidiSong 
   }
 
   return { name: base, tune };
+}
+
+/** Choose the track most likely to be the vocal melody. */
+function pickMelodyTrack(tracks: TrackData[], lyrics: RawLyric[], tpq: number): TrackData {
+  if (tracks.length === 1) return tracks[0];
+  let best = tracks[0];
+  let bestScore = -Infinity;
+  for (const tr of tracks) {
+    const notes = tr.notes;
+    if (!notes.length) continue;
+    const n = notes.length;
+    let vocal = 0;
+    for (const note of notes) if (note.midi >= 36 && note.midi <= 84) vocal++;
+    const vocalRatio = vocal / n;
+    // monophony: how often a new note starts after the previous ended
+    let mono = 0;
+    for (let i = 1; i < notes.length; i++) if (notes[i].tick >= notes[i - 1].tick + notes[i - 1].dur - 1) mono++;
+    const monoRatio = notes.length > 1 ? mono / (notes.length - 1) : 1;
+    let lyricAlign = 0;
+    if (lyrics.length) {
+      const a = notes[0].tick;
+      const b = notes[notes.length - 1].tick + notes[notes.length - 1].dur;
+      for (const l of lyrics) if (l.tick >= a - tpq && l.tick <= b + tpq) lyricAlign++;
+      lyricAlign /= Math.max(1, lyrics.length);
+    }
+    const name = tr.name.toLowerCase();
+    const nameBonus = /vocal|melody|voice|sing|lyric|lead|mel|メロディ|歌/.test(name) ? 1.5 : 0;
+    const score = vocalRatio * 2 + monoRatio * 1.5 + lyricAlign * 3 + nameBonus + Math.min(n, 500) / 500;
+    if (score > bestScore) {
+      bestScore = score;
+      best = tr;
+    }
+  }
+  return best;
+}
+
+/** Reduce a note list to a single monophonic line (highest note where overlapping). */
+function toMonophonic(notes: RawNote[]): RawNote[] {
+  if (!notes.length) return [];
+  const sorted = [...notes].sort((a, b) => a.tick - b.tick || b.midi - a.midi || b.dur - a.dur);
+  const out: RawNote[] = [];
+  for (const n of sorted) {
+    const prev = out[out.length - 1];
+    if (!prev) {
+      out.push({ ...n });
+      continue;
+    }
+    const prevEnd = prev.tick + prev.dur;
+    if (n.tick >= prevEnd - 1) {
+      // small gap/overlap at boundary: start next at/after previous end
+      if (n.tick < prevEnd) {
+        prev.dur = Math.max(1, n.tick - prev.tick);
+      }
+      out.push({ ...n });
+    } else {
+      // overlapping notes: keep the higher-pitched one
+      if (n.midi > prev.midi) {
+        prev.dur = Math.max(1, n.tick - prev.tick);
+        if (prev.dur <= 1 && n.tick <= prev.tick) {
+          out[out.length - 1] = { ...n };
+        } else {
+          out.push({ ...n });
+        }
+      } else if (n.tick + n.dur > prevEnd) {
+        // lower note extends beyond: keep as continuation after prev ends
+        out.push({ midi: n.midi, tick: prevEnd, dur: n.tick + n.dur - prevEnd });
+      }
+    }
+  }
+  // remove zero/negative durations and sort
+  return out.filter((n) => n.dur > 0).sort((a, b) => a.tick - b.tick);
 }
 
 function decodeText(buf: Uint8Array, off: number, len: number): string {
