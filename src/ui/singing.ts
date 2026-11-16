@@ -357,10 +357,22 @@ export async function playTune(idOrTune: string | Tune, body: BodyMix, ready?: (
   const t0 = 0.35;
   const beat = 60 / bpm;
 
-  // Imported MIDI with exact note timing and aligned syllables: preserve rests/gaps by planning
-  // contiguous phrases at their original beat positions (like `chimera render notes`).
-  if (midiSyls && midiTimeline && tune.lyrics !== undefined && st.lyrics === tune.lyrics && midiSyls.length === midiTimeline.length) {
-    const events = midiTimeline.map((e, i) => ({ ...e, midi: e.midi + shift, syl: midiSyls[i] }));
+  // Imported MIDI with exact note timing: preserve rests/gaps by planning contiguous phrases at
+  // their original beat positions (like `chimera render notes`).
+  if (midiTimeline && midiTimeline.length) {
+    const haveAlignedSyls = !!(midiSyls && midiSyls.length === midiTimeline.length);
+    let syls: Syllable[];
+    if (haveAlignedSyls) {
+      syls = midiSyls!;
+    } else if (own.length === midiTimeline.length) {
+      syls = own;
+    } else if (own.length) {
+      syls = midiTimeline.map((_, i) => own[i % own.length]);
+    } else {
+      const laSyls = lyricsToSyllables(la(tune));
+      syls = midiTimeline.map((_, i) => laSyls[i % Math.max(1, laSyls.length)] || AH);
+    }
+    const events = midiTimeline.map((e, i) => ({ ...e, midi: e.midi + shift, syl: syls[i] }));
     const phrases: { notes: { midi: number; beats: number; syl: Syllable }[]; startBeat: number; idxs: number[] }[] = [];
     for (let i = 0; i < events.length; i++) {
       const e = events[i];
@@ -397,12 +409,12 @@ export async function playTune(idOrTune: string | Tune, body: BodyMix, ready?: (
     if (!events.length) return false;
     hooks.onStart?.();
     const planId = engine.schedule({ gestures: allGestures, segments: allSegments, end: planEnd });
-    const parent: number[] = events.map((_, i) => (events[i].syl.melisma && i > 0 ? 0 : i)); // placeholder, recompute
+    const parent: number[] = new Array(events.length);
     for (let i = 0; i < events.length; i++) parent[i] = events[i].syl.melisma && i > 0 ? parent[i - 1] : i;
     const shown = parent.map((p) => written(events[p].syl));
     const from = events.map((_, i) => i);
     demoRun = { id: planId, times: noteTimes, midi: allNotes.map((n) => n.midi), text: allNotes.map((n) => n.syl.text), shown, parent, from, end: planEnd, offset: null, hooks };
-    useSing.setState({ syllables: midiSyls, cursor: Math.min(st.cursor, Math.max(0, midiSyls.length - 1)), playing: tune.id, at: -1 });
+    useSing.setState({ syllables: haveAlignedSyls ? midiSyls! : syls, cursor: Math.min(st.cursor, Math.max(0, (haveAlignedSyls ? midiSyls! : syls).length - 1)), playing: tune.id, at: -1 });
     return true;
   }
 
